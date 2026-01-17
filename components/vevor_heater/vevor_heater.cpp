@@ -544,8 +544,8 @@ void VevorHeater::check_voltage_safety() {
     if ((input_voltage_ < min_voltage_start_) && !(input_voltage_ == 0)) {
       ESP_LOGW(TAG, "Low voltage detected during start: %.1fV < %.1fV", 
                input_voltage_, min_voltage_start_);
-      voltage_error = true;
-      heater_enabled_ = false;  // Prevent starting
+      //voltage_error = true;
+      //heater_enabled_ = false;  // Prevent starting
     }
   } else if (current_state_ == HeaterState::STABLE_COMBUSTION) {
     // During stable combustion, check if voltage is sufficient to keep running
