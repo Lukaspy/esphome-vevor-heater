@@ -166,10 +166,12 @@ CONFIG_SCHEMA = cv.All(
             cv.Optional(CONF_TIME_ID): cv.use_id(time.RealTimeClock),
             cv.Optional(CONF_EXTERNAL_TEMPERATURE_SENSOR): cv.use_id(sensor.Sensor),
             cv.Optional("min_voltage_start", default=12.3): cv.float_range(
-                min=10.0, max=15.0
+                # Allow 0 to disable start checks entirely.
+                min=0.0, max=15.0
             ),
             cv.Optional("min_voltage_operate", default=11.4): cv.float_range(
-                min=9.0, max=14.0
+                # Allow 0 to disable operate checks entirely.
+                min=0.0, max=14.0
             ),
             # Antifreeze mode temperature thresholds
             cv.Optional("antifreeze_temp_on", default=2.0): cv.float_range(
@@ -184,6 +186,25 @@ CONFIG_SCHEMA = cv.All(
             cv.Optional("antifreeze_temp_off", default=9.0): cv.float_range(
                 min=-20.0, max=30.0
             ),
+
+            # Automatic mode settings (runs locally on the ESP32)
+            # These are in the units given by `automatic_units`.
+            cv.Optional("automatic_units", default="F"): cv.one_of("F", "C", upper=True),
+            cv.Optional("automatic_day_start_hour", default=7): cv.int_range(min=0, max=23),
+            cv.Optional("automatic_night_start_hour", default=19): cv.int_range(min=0, max=23),
+            cv.Optional("automatic_day_on", default=50.0): cv.float_range(min=-40.0, max=140.0),
+            cv.Optional("automatic_day_off", default=60.0): cv.float_range(min=-40.0, max=140.0),
+            cv.Optional("automatic_night_target", default=55.0): cv.float_range(min=-40.0, max=140.0),
+            cv.Optional("automatic_overtemp_off", default=70.0): cv.float_range(min=-40.0, max=200.0),
+            cv.Optional("automatic_overtemp_restart", default=50.0): cv.float_range(min=-40.0, max=200.0),
+            cv.Optional("automatic_freeze_override", default=40.0): cv.float_range(min=-40.0, max=200.0),
+            cv.Optional("automatic_day_min_power_percent", default=20.0): cv.float_range(min=10.0, max=100.0),
+            cv.Optional("automatic_night_min_power_percent", default=20.0): cv.float_range(min=10.0, max=100.0),
+            cv.Optional("automatic_max_power_percent", default=100.0): cv.float_range(min=10.0, max=100.0),
+            cv.Optional("automatic_full_power_error", default=15.0): cv.float_range(min=0.1, max=60.0),
+            cv.Optional("automatic_min_run_time", default="15min"): cv.positive_time_period_milliseconds,
+            cv.Optional("automatic_min_off_time", default="5min"): cv.positive_time_period_milliseconds,
+            cv.Optional("automatic_power_step_interval", default="15s"): cv.positive_time_period_milliseconds,
             # Individual sensor overrides (optional) - removed duplicate temperature sensor
             cv.Optional(CONF_INPUT_VOLTAGE): SENSOR_SCHEMAS[CONF_INPUT_VOLTAGE],
             cv.Optional(CONF_STATE): SENSOR_SCHEMAS[CONF_STATE],
@@ -279,6 +300,24 @@ async def to_code(config):
     cg.add(var.set_antifreeze_temp_medium(config["antifreeze_temp_medium"]))
     cg.add(var.set_antifreeze_temp_low(config["antifreeze_temp_low"]))
     cg.add(var.set_antifreeze_temp_off(config["antifreeze_temp_off"]))
+
+    # Set automatic mode thresholds/timing (these are always configured; they only take effect when control_mode is automatic)
+    cg.add(var.set_automatic_use_fahrenheit(config["automatic_units"] == "F"))
+    cg.add(var.set_automatic_day_start_hour(config["automatic_day_start_hour"]))
+    cg.add(var.set_automatic_night_start_hour(config["automatic_night_start_hour"]))
+    cg.add(var.set_automatic_day_on(config["automatic_day_on"]))
+    cg.add(var.set_automatic_day_off(config["automatic_day_off"]))
+    cg.add(var.set_automatic_night_target(config["automatic_night_target"]))
+    cg.add(var.set_automatic_overtemp_off(config["automatic_overtemp_off"]))
+    cg.add(var.set_automatic_overtemp_restart(config["automatic_overtemp_restart"]))
+    cg.add(var.set_automatic_freeze_override(config["automatic_freeze_override"]))
+    cg.add(var.set_automatic_day_min_power_percent(config["automatic_day_min_power_percent"]))
+    cg.add(var.set_automatic_night_min_power_percent(config["automatic_night_min_power_percent"]))
+    cg.add(var.set_automatic_max_power_percent(config["automatic_max_power_percent"]))
+    cg.add(var.set_automatic_full_power_error(config["automatic_full_power_error"]))
+    cg.add(var.set_automatic_min_run_time(config["automatic_min_run_time"]))
+    cg.add(var.set_automatic_min_off_time(config["automatic_min_off_time"]))
+    cg.add(var.set_automatic_power_step_interval(config["automatic_power_step_interval"]))
     
     # Set time component if provided
     if CONF_TIME_ID in config:
@@ -397,7 +436,7 @@ async def to_code(config):
     
     # Select component for control mode
     if CONF_CONTROL_MODE_SELECT in config:
-        sel = await select.new_select(config[CONF_CONTROL_MODE_SELECT], options=["Manual", "Antifreeze"])  # "Automatic" commented out
+        sel = await select.new_select(config[CONF_CONTROL_MODE_SELECT], options=["Manual", "Automatic", "Antifreeze"])
         cg.add(sel.set_vevor_heater(var))
     
     # Switch component for heater power

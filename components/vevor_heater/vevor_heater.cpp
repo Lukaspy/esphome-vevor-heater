@@ -41,6 +41,13 @@ void VevorHeater::setup() {
   this->last_send_time_ = millis();
   this->last_received_time_ = millis();
   this->external_temperature_ = NAN;
+  this->input_voltage_valid_ = false;
+
+  // Automatic mode timing state
+  this->automatic_last_on_ms_ = 0;
+  this->automatic_last_off_ms_ = millis();
+  this->automatic_last_power_change_ms_ = 0;
+  this->automatic_overtemp_lockout_ = false;
   
   // Initialize fuel consumption tracking
   this->last_consumption_update_ = millis();
@@ -56,7 +63,10 @@ void VevorHeater::setup() {
   }
   
   ESP_LOGCONFIG(TAG, "Vevor Heater setup completed");
-  ESP_LOGCONFIG(TAG, "Control mode: %s", control_mode_ == ControlMode::AUTOMATIC ? "Automatic" : "Manual");
+  const char *mode_str = "Manual";
+  if (control_mode_ == ControlMode::AUTOMATIC) mode_str = "Automatic";
+  if (control_mode_ == ControlMode::ANTIFREEZE) mode_str = "Antifreeze";
+  ESP_LOGCONFIG(TAG, "Control mode: %s", mode_str);
   ESP_LOGCONFIG(TAG, "Default power level: %.0f%%", default_power_percent_);
   ESP_LOGCONFIG(TAG, "Injected per pulse: %.2f ml", injected_per_pulse_);
   ESP_LOGCONFIG(TAG, "Daily consumption: %.2f ml", daily_consumption_ml_);
@@ -78,6 +88,11 @@ void VevorHeater::update() {
   
   // Check voltage safety
   check_voltage_safety();
+
+  // Handle automatic control mode logic
+  if (control_mode_ == ControlMode::AUTOMATIC) {
+    handle_automatic_mode();
+  }
   
   // Handle antifreeze mode logic
   if (control_mode_ == ControlMode::ANTIFREEZE) {
@@ -137,7 +152,16 @@ void VevorHeater::check_uart_data() {
       
       // Check if we have enough bytes to determine frame length
       if (rx_buffer_.size() >= 4) {
-        uint8_t expected_length = (rx_buffer_[3] == HEATER_FRAME_LENGTH) ? 56 : 15;
+        // Total frame length is (payload_length + 5) for both controller (0x0B -> 16 bytes)
+        // and heater (0x33 -> 56 bytes) frames.
+        uint8_t expected_length = rx_buffer_[3] + 5;
+        if (expected_length < 6 || expected_length > 80) {
+          // Bogus length byte -> reset sync
+          ESP_LOGW(TAG, "Invalid expected frame length %u, resetting", expected_length);
+          rx_buffer_.clear();
+          frame_sync_ = false;
+          continue;
+        }
         
         if (rx_buffer_.size() >= expected_length) {
           // Frame complete, process it
@@ -281,7 +305,7 @@ void VevorHeater::process_heater_frame(const std::vector<uint8_t> &frame) {
     // Update all sensors
     update_sensors(frame);
     
-  } else if (frame[3] == CONTROLLER_FRAME_LENGTH && frame.size() >= 15) {
+  } else if (frame[3] == CONTROLLER_FRAME_LENGTH && frame.size() >= 16) {
     // Short frame (controller echo)
     ESP_LOGVV(TAG, "Received controller frame echo");
     // Usually just an echo of our own transmission
@@ -302,9 +326,15 @@ void VevorHeater::update_sensors(const std::vector<uint8_t> &frame) {
   
   // Input voltage (byte 11)
   uint8_t voltage_raw = frame[11];
-  if (input_voltage_sensor_ && voltage_raw > 0) {
+  if (voltage_raw > 0) {
+    input_voltage_valid_ = true;
     input_voltage_ = voltage_raw / 10.0f;
-    input_voltage_sensor_->publish_state(input_voltage_);
+    if (input_voltage_sensor_) {
+      input_voltage_sensor_->publish_state(input_voltage_);
+    }
+  } else {
+    // Some heater variants report 0V while OFF; treat as "unknown" rather than a real 0V.
+    input_voltage_valid_ = false;
   }
   
   // Glow plug current (byte 13)
@@ -541,7 +571,7 @@ void VevorHeater::check_voltage_safety() {
   if ((current_state_ == HeaterState::OFF || current_state_ == HeaterState::POLLING_STATE) && 
       heater_enabled_) {
     // During OFF/POLLING_STATE, check if voltage is sufficient to start
-    if ((input_voltage_ < min_voltage_start_) && !(input_voltage_ == 0)) {
+    if (input_voltage_valid_ && (input_voltage_ < min_voltage_start_)) {
       ESP_LOGW(TAG, "Low voltage detected during start: %.1fV < %.1fV", 
                input_voltage_, min_voltage_start_);
       //voltage_error = true;
@@ -549,7 +579,7 @@ void VevorHeater::check_voltage_safety() {
     }
   } else if (current_state_ == HeaterState::STABLE_COMBUSTION) {
     // During stable combustion, check if voltage is sufficient to keep running
-    if (input_voltage_ < min_voltage_operate_) {
+    if (input_voltage_valid_ && (input_voltage_ < min_voltage_operate_)) {
       ESP_LOGW(TAG, "Low voltage detected during operation: %.1fV < %.1fV - Stopping heater", 
                input_voltage_, min_voltage_operate_);
       voltage_error = true;
@@ -568,6 +598,169 @@ void VevorHeater::check_voltage_safety() {
     low_voltage_error_ = false;
     if (low_voltage_error_sensor_) {
       low_voltage_error_sensor_->publish_state(false);
+    }
+  }
+}
+
+bool VevorHeater::automatic_is_daytime_() {
+#ifdef USE_TIME
+  if (time_component_ != nullptr) {
+    auto now = time_component_->now();
+    if (now.is_valid()) {
+      const uint8_t hour = now.hour;
+      const uint8_t day_start = automatic_day_start_hour_ % 24;
+      const uint8_t night_start = automatic_night_start_hour_ % 24;
+
+      // Day interval: [day_start, night_start) with wrap-safe handling.
+      if (day_start == night_start) {
+        // Degenerate: treat as always-night for safety.
+        return false;
+      }
+      if (day_start < night_start) {
+        return (hour >= day_start) && (hour < night_start);
+      }
+      // Wrap case (e.g., day_start=18, night_start=6): daytime is outside [night_start, day_start)
+      return !((hour >= night_start) && (hour < day_start));
+    }
+  }
+#endif
+  // If time is unavailable, assume night (safer for freeze protection).
+  return false;
+}
+
+float VevorHeater::automatic_get_ambient_temp_() {
+  if (!has_external_sensor()) {
+    return NAN;
+  }
+  if (automatic_use_fahrenheit_) {
+    return c_to_f_(external_temperature_);
+  }
+  return external_temperature_;
+}
+
+float VevorHeater::automatic_compute_power_percent_(float error, float min_pct) const {
+  // error is (setpoint - ambient) in configured units. Negative means we're above setpoint.
+  const float min_p = std::max(10.0f, std::min(100.0f, min_pct));
+  const float max_p = std::max(min_p, std::min(100.0f, automatic_max_power_percent_));
+
+  float e = error;
+  if (e < 0.0f) {
+    e = 0.0f;
+  }
+  if (automatic_full_power_error_ <= 0.01f) {
+    return max_p;
+  }
+  const float frac = std::min(1.0f, e / automatic_full_power_error_);
+  return min_p + (max_p - min_p) * frac;
+}
+
+void VevorHeater::handle_automatic_mode() {
+  // This mode is designed to be network-independent:
+  // - Day: heater may be fully OFF when warm enough.
+  // - Night: keep running at a low "idle" power to avoid glow-plug restarts.
+  // - Overtemp latch: hard OFF above a high limit, restart only once it cools.
+
+  const uint32_t now = millis();
+
+  // Require an ambient sensor for accurate control; if missing, fail-safe "warm":
+  // keep heater on at the configured night minimum power.
+  const float temp = automatic_get_ambient_temp_();
+  if (std::isnan(temp)) {
+    if (!heater_enabled_) {
+      // bypass min-off time in this failure mode (better warm than freeze)
+      set_power_level_percent(automatic_night_min_power_percent_);
+      turn_on();
+      automatic_last_on_ms_ = now;
+      automatic_last_power_change_ms_ = now;
+      ESP_LOGW(TAG, "Automatic: ambient temp unavailable; running at %.0f%% as fail-safe", automatic_night_min_power_percent_);
+    }
+    return;
+  }
+
+  // Overtemperature lockout (latched)
+  if (temp >= automatic_overtemp_off_) {
+    if (!automatic_overtemp_lockout_) {
+      ESP_LOGW(TAG, "Automatic: overtemp %.1f >= %.1f -> lockout OFF", temp, automatic_overtemp_off_);
+    }
+    automatic_overtemp_lockout_ = true;
+  }
+  if (automatic_overtemp_lockout_ && temp <= automatic_overtemp_restart_) {
+    automatic_overtemp_lockout_ = false;
+    ESP_LOGI(TAG, "Automatic: cooled to %.1f <= %.1f -> lockout cleared", temp, automatic_overtemp_restart_);
+  }
+
+  bool desired_enabled = heater_enabled_;
+  float desired_power_pct = power_level_ * 10.0f;
+  bool force_start = false;
+  bool force_stop = false;
+
+  if (automatic_overtemp_lockout_) {
+    desired_enabled = false;
+    desired_power_pct = 0.0f;
+    force_stop = true;
+  } else if (temp <= automatic_freeze_override_) {
+    // Absolute freeze protection override.
+    desired_enabled = true;
+    desired_power_pct = automatic_max_power_percent_;
+    force_start = true;
+  } else {
+    const bool is_day = automatic_is_daytime_();
+
+    if (is_day) {
+      // Daytime hysteresis band: ON below day_on, OFF above day_off.
+      if (temp >= automatic_day_off_) {
+        desired_enabled = false;
+      } else if (temp <= automatic_day_on_) {
+        desired_enabled = true;
+      } else {
+        // In hysteresis window, keep previous state.
+        desired_enabled = heater_enabled_;
+      }
+
+      if (desired_enabled) {
+        const float error = automatic_day_off_ - temp;
+        desired_power_pct = automatic_compute_power_percent_(error, automatic_day_min_power_percent_);
+      } else {
+        desired_power_pct = 0.0f;
+      }
+    } else {
+      // Night: keep heater running and throttle power around target.
+      desired_enabled = true;
+      const float error = automatic_night_target_ - temp;
+      desired_power_pct = automatic_compute_power_percent_(error, automatic_night_min_power_percent_);
+
+      // Always honor night idle minimum when running.
+      if (desired_power_pct < automatic_night_min_power_percent_) {
+        desired_power_pct = automatic_night_min_power_percent_;
+      }
+    }
+  }
+
+  // Enforce min run/off times unless we're in a safety override.
+  if (desired_enabled != heater_enabled_) {
+    if (desired_enabled) {
+      const bool allowed = force_start || (now - automatic_last_off_ms_ >= automatic_min_off_time_ms_);
+      if (allowed) {
+        set_power_level_percent(desired_power_pct);
+        turn_on();
+        automatic_last_on_ms_ = now;
+        automatic_last_power_change_ms_ = now;
+      }
+    } else {
+      const bool allowed = force_stop || (now - automatic_last_on_ms_ >= automatic_min_run_time_ms_);
+      if (allowed) {
+        turn_off();
+        automatic_last_off_ms_ = now;
+      }
+    }
+  } else if (heater_enabled_) {
+    // Power adjustment rate limiting
+    if (force_start || (now - automatic_last_power_change_ms_ >= automatic_power_step_interval_ms_)) {
+      const uint8_t desired_level = static_cast<uint8_t>(std::max(1.0f, std::min(10.0f, desired_power_pct / 10.0f)));
+      if (desired_level != power_level_) {
+        set_power_level_percent(desired_power_pct);
+        automatic_last_power_change_ms_ = now;
+      }
     }
   }
 }
@@ -776,7 +969,10 @@ void VevorHeater::set_power_level_percent(float percent) {
 
 void VevorHeater::dump_config() {
   ESP_LOGCONFIG(TAG, "Vevor Heater:");
-  ESP_LOGCONFIG(TAG, "  Control Mode: %s", control_mode_ == ControlMode::AUTOMATIC ? "Automatic" : "Manual");
+  const char *mode_str = "Manual";
+  if (control_mode_ == ControlMode::AUTOMATIC) mode_str = "Automatic";
+  if (control_mode_ == ControlMode::ANTIFREEZE) mode_str = "Antifreeze";
+  ESP_LOGCONFIG(TAG, "  Control Mode: %s", mode_str);
   ESP_LOGCONFIG(TAG, "  Default Power Level: %.0f%%", default_power_percent_);
   ESP_LOGCONFIG(TAG, "  Power Level: %d/10", power_level_);
   ESP_LOGCONFIG(TAG, "  Target Temperature: %.1f°C", target_temperature_);
@@ -796,6 +992,17 @@ void VevorHeater::dump_config() {
     if (control_mode_ == ControlMode::AUTOMATIC) {
       ESP_LOGW(TAG, "  WARNING: Automatic mode requires external temperature sensor!");
     }
+  }
+
+  if (control_mode_ == ControlMode::AUTOMATIC) {
+    ESP_LOGCONFIG(TAG, "  Automatic units: %s", automatic_use_fahrenheit_ ? "F" : "C");
+    ESP_LOGCONFIG(TAG, "  Automatic day hours: %02u:00-%02u:00", automatic_day_start_hour_ % 24, automatic_night_start_hour_ % 24);
+    ESP_LOGCONFIG(TAG, "  Automatic day hysteresis: ON<=%.1f, OFF>=%.1f", automatic_day_on_, automatic_day_off_);
+    ESP_LOGCONFIG(TAG, "  Automatic night target: %.1f (min %.0f%%)", automatic_night_target_, automatic_night_min_power_percent_);
+    ESP_LOGCONFIG(TAG, "  Automatic freeze override: <=%.1f", automatic_freeze_override_);
+    ESP_LOGCONFIG(TAG, "  Automatic overtemp lockout: >=%.1f, restart<=%.1f", automatic_overtemp_off_, automatic_overtemp_restart_);
+    ESP_LOGCONFIG(TAG, "  Automatic min on/off: %us/%us", (unsigned)(automatic_min_run_time_ms_ / 1000), (unsigned)(automatic_min_off_time_ms_ / 1000));
+    ESP_LOGCONFIG(TAG, "  Automatic power step interval: %us", (unsigned)(automatic_power_step_interval_ms_ / 1000));
   }
   
   // Removed LOG_SENSOR for the duplicate temperature_sensor_

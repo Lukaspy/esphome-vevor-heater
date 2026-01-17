@@ -12,6 +12,8 @@
 #include "esphome/components/select/select.h"
 #include "esphome/components/switch/switch.h"
 #include "esphome/core/preferences.h"
+#include <algorithm>
+#include <cmath>
 #include <vector>
 
 namespace esphome {
@@ -85,6 +87,24 @@ class VevorHeater : public PollingComponent, public uart::UARTDevice {
   void set_antifreeze_temp_medium(float temp) { antifreeze_temp_medium_ = temp; }
   void set_antifreeze_temp_low(float temp) { antifreeze_temp_low_ = temp; }
   void set_antifreeze_temp_off(float temp) { antifreeze_temp_off_ = temp; }
+
+  // Automatic mode configuration
+  void set_automatic_use_fahrenheit(bool use_f) { automatic_use_fahrenheit_ = use_f; }
+  void set_automatic_day_start_hour(uint8_t hour) { automatic_day_start_hour_ = hour % 24; }
+  void set_automatic_night_start_hour(uint8_t hour) { automatic_night_start_hour_ = hour % 24; }
+  void set_automatic_day_on(float temp) { automatic_day_on_ = temp; }
+  void set_automatic_day_off(float temp) { automatic_day_off_ = temp; }
+  void set_automatic_night_target(float temp) { automatic_night_target_ = temp; }
+  void set_automatic_overtemp_off(float temp) { automatic_overtemp_off_ = temp; }
+  void set_automatic_overtemp_restart(float temp) { automatic_overtemp_restart_ = temp; }
+  void set_automatic_freeze_override(float temp) { automatic_freeze_override_ = temp; }
+  void set_automatic_day_min_power_percent(float pct) { automatic_day_min_power_percent_ = pct; }
+  void set_automatic_night_min_power_percent(float pct) { automatic_night_min_power_percent_ = pct; }
+  void set_automatic_max_power_percent(float pct) { automatic_max_power_percent_ = pct; }
+  void set_automatic_full_power_error(float err) { automatic_full_power_error_ = err; }
+  void set_automatic_min_run_time(uint32_t ms) { automatic_min_run_time_ms_ = ms; }
+  void set_automatic_min_off_time(uint32_t ms) { automatic_min_off_time_ms_ = ms; }
+  void set_automatic_power_step_interval(uint32_t ms) { automatic_power_step_interval_ms_ = ms; }
   
   // Time component setter
   void set_time_component(time::RealTimeClock *time) { time_component_ = time; }
@@ -166,6 +186,13 @@ class VevorHeater : public PollingComponent, public uart::UARTDevice {
   void handle_communication_timeout();
   void check_voltage_safety();
   void handle_antifreeze_mode();
+  void handle_automatic_mode();
+
+  // Automatic mode helpers
+  bool automatic_is_daytime_();
+  float automatic_get_ambient_temp_();
+  float automatic_compute_power_percent_(float error, float min_pct) const;
+  static float c_to_f_(float c) { return (c * 9.0f / 5.0f) + 32.0f; }
   
   // Fuel consumption tracking
   void update_fuel_consumption(float pump_frequency);
@@ -198,11 +225,36 @@ class VevorHeater : public PollingComponent, public uart::UARTDevice {
   static constexpr float ANTIFREEZE_HYSTERESIS = 0.4f;  // Hysteresis in °C to prevent rapid cycling
   float last_antifreeze_power_{0.0f};   // Track last power level for hysteresis logic
   bool antifreeze_active_{false};       // Track if antifreeze is actively heating
+
+  // Automatic control configuration
+  bool automatic_use_fahrenheit_{true};
+  uint8_t automatic_day_start_hour_{7};
+  uint8_t automatic_night_start_hour_{19};
+  float automatic_day_on_{50.0f};
+  float automatic_day_off_{60.0f};
+  float automatic_night_target_{55.0f};
+  float automatic_overtemp_off_{70.0f};
+  float automatic_overtemp_restart_{50.0f};
+  float automatic_freeze_override_{40.0f};
+  float automatic_day_min_power_percent_{20.0f};
+  float automatic_night_min_power_percent_{20.0f};
+  float automatic_max_power_percent_{100.0f};
+  float automatic_full_power_error_{15.0f};
+  uint32_t automatic_min_run_time_ms_{900000};         // 15 min
+  uint32_t automatic_min_off_time_ms_{300000};         // 5 min
+  uint32_t automatic_power_step_interval_ms_{15000};   // 15 sec
+
+  // Automatic control internal state
+  bool automatic_overtemp_lockout_{false};
+  uint32_t automatic_last_on_ms_{0};
+  uint32_t automatic_last_off_ms_{0};
+  uint32_t automatic_last_power_change_ms_{0};
   
   // Parsed sensor values
   float current_temperature_{0.0};
   float external_temperature_{NAN};
   float input_voltage_{0.0};
+  bool input_voltage_valid_{false};
   float heat_exchanger_temperature_{0.0};
   uint16_t fan_speed_{0};
   float pump_frequency_{0.0};
@@ -346,10 +398,11 @@ class VevorControlModeSelect : public select::Select, public Component {
     if (heater_) {
       if (heater_->is_manual_mode()) {
         this->publish_state("Manual");
+      } else if (heater_->is_automatic_mode()) {
+        this->publish_state("Automatic");
       } else if (heater_->is_antifreeze_mode()) {
         this->publish_state("Antifreeze");
       }
-      // Automatic mode commented out for now
     }
   }
   
@@ -358,12 +411,11 @@ class VevorControlModeSelect : public select::Select, public Component {
     if (heater_) {
       if (value == "Manual") {
         heater_->set_control_mode(ControlMode::MANUAL);
+      } else if (value == "Automatic") {
+        heater_->set_control_mode(ControlMode::AUTOMATIC);
       } else if (value == "Antifreeze") {
         heater_->set_control_mode(ControlMode::ANTIFREEZE);
       }
-      // else if (value == "Automatic") {
-      //   heater_->set_control_mode(ControlMode::AUTOMATIC);
-      // }
       this->publish_state(value);
     }
   }
