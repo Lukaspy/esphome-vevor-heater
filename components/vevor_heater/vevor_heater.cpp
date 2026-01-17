@@ -744,7 +744,7 @@ void VevorHeater::turn_on() {
   }
   
   // Check voltage before allowing start
-  if (input_voltage_ < min_voltage_start_) {
+  /*if (input_voltage_ < min_voltage_start_) {
     ESP_LOGW(TAG, "Cannot start heater: voltage too low (%.1fV < %.1fV)", 
              input_voltage_, min_voltage_start_);
     low_voltage_error_ = true;
@@ -753,6 +753,7 @@ void VevorHeater::turn_on() {
     }
     return;
   }
+  */
   
   heater_enabled_ = true;
   // Set to default power level on turn on
