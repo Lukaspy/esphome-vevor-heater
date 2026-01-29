@@ -43,7 +43,7 @@ void VevorHeater::setup() {
   this->external_temperature_ = NAN;
   this->input_voltage_valid_ = false;
 
-  // Boot recovery window start
+  // Boot recovery window start (used to avoid accidentally stopping a heater that was already running)
   this->boot_time_ms_ = millis();
   this->boot_adopted_running_ = false;
 
@@ -318,6 +318,8 @@ void VevorHeater::process_heater_frame(const std::vector<uint8_t> &frame) {
     ESP_LOGVV(TAG, "Received controller frame echo");
     // Usually just an echo of our own transmission
   }
+}
+
 
 void VevorHeater::maybe_adopt_running_state_on_boot_(const std::vector<uint8_t> &frame) {
   const uint32_t now = millis();
@@ -357,7 +359,6 @@ void VevorHeater::maybe_adopt_running_state_on_boot_(const std::vector<uint8_t> 
   }
 }
 
-}
 
 void VevorHeater::update_sensors(const std::vector<uint8_t> &frame) {
   // State sensor

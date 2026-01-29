@@ -211,8 +211,9 @@ class VevorHeater : public PollingComponent, public uart::UARTDevice {
   bool frame_sync_{false};
   uint32_t polling_interval_ms_{DEFAULT_POLLING_INTERVAL_MS};
 
-  // Boot recovery (anti-shutdown): if the MCU resets while the heater is running,
-  // adopt the running state for a short window to avoid sending a STOP command.
+  // Boot recovery: if the MCU resets while the heater is running, adopt the running state for
+  // a short window to avoid accidentally sending a STOP command due to heater_enabled_ defaulting
+  // to false at boot.
   uint32_t boot_time_ms_{0};
   bool boot_adopted_running_{false};
   static constexpr uint32_t BOOT_ADOPT_WINDOW_MS = 180000;  // 3 minutes
